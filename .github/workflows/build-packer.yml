@@ -17,17 +17,18 @@ jobs:
           distribution: 'zulu'
           java-version: '17'
 
-      - name: Cài đặt Android SDK & NDK
-        uses: android-actions/setup-android@v3
+      - name: Tự động đồng ý mọi giấy phép Android SDK
+        run: |
+          yes | sdkmanager --licenses || true
 
-      - name: Tự động khởi tạo toàn bộ cấu trúc dự án & Native C++
+      - name: Tự động khởi tạo cấu trúc dự án & Native C++
         run: |
           mkdir -p app/src/main/java/com/secure/stub
           mkdir -p app/src/main/cpp
           mkdir -p app/src/main/assets
           mkdir -p app/src/main/res/values
 
-          # 1. Tạo CMakeLists.txt để biên dịch NDK C++
+          # 1. CMakeLists.txt
           cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("secureshield")
@@ -43,7 +44,7 @@ jobs:
           )
           EOF
 
-          # 2. Tạo mã nguồn Native C++ (Chống Frida, Anti-Trace/Debugger, quét bộ nhớ)
+          # 2. Native C++ (Anti-Frida, Anti-Trace, Watchdog)
           cat << 'EOF' > app/src/main/cpp/native-lib.cpp
           #include <jni.h>
           #include <string>
@@ -53,12 +54,10 @@ jobs:
           #include <android/log.h>
 
           #define LOG_TAG "SecureShield"
-          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-          // 1. Chống Debugger qua Ptrace & TracerPid
           bool checkTracer() {
               if (ptrace(PTRACE_TRACEME, 0, 1, 0) < 0) {
-                  return true; // Đang bị tool trace/debug gắn vào
+                  return true;
               }
               std::ifstream statusFile("/proc/self/status");
               std::string line;
@@ -71,7 +70,6 @@ jobs:
               return false;
           }
 
-          // 2. Chống Hooking (Quét Frida, Xposed trong maps RAM)
           bool checkFridaInMemory() {
               std::ifstream mapsFile("/proc/self/maps");
               std::string line;
@@ -88,14 +86,13 @@ jobs:
           extern "C" JNIEXPORT jboolean JNICALL
           Java_com_secure_stub_StubApp_verifyEnvironment(JNIEnv *env, jobject thiz) {
               if (checkTracer() || checkFridaInMemory()) {
-                  // Phát hiện can thiệp: Trả về false để huỷ chạy
                   return JNI_FALSE;
               }
               return JNI_TRUE;
           }
           EOF
 
-          # 3. Tạo lớp vỏ nạp Java (StubApp)
+          # 3. StubApp
           cat << 'EOF' > app/src/main/java/com/secure/stub/StubApp.java
           package com.secure.stub;
 
@@ -114,16 +111,14 @@ jobs:
               protected void attachBaseContext(Context base) {
                   super.attachBaseContext(base);
                   if (!verifyEnvironment()) {
-                      // Phát hiện môi trường dịch ngược/hook -> Tự kết liễu tiến trình
                       Process.killProcess(Process.myPid());
                       System.exit(0);
                   }
-                  // Quá trình giải mã Dex trong RAM và nạp dynamic sẽ thực thi tại đây
               }
           }
           EOF
 
-          # 4. Tạo MainActivity rỗng
+          # 4. MainActivity
           cat << 'EOF' > app/src/main/java/com/secure/stub/MainActivity.java
           package com.secure.stub;
 
@@ -143,7 +138,7 @@ jobs:
           }
           EOF
 
-          # 5. Tạo AndroidManifest.xml
+          # 5. AndroidManifest
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
               package="com.secure.stub">
@@ -165,7 +160,7 @@ jobs:
           </manifest>
           EOF
 
-          # 6. Tạo file cấu hình Gradle
+          # 6. Gradle configs
           cat << 'EOF' > settings.gradle
           rootProject.name = "SecurePacker"
           include ':app'
@@ -215,9 +210,7 @@ jobs:
 
               buildTypes {
                   release {
-                      minifyEnabled true
-                      shrinkResources false
-                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+                      minifyEnabled false
                   }
                   debug {
                       minifyEnabled false
@@ -233,10 +226,9 @@ jobs:
           }
           EOF
 
-      - name: Biên dịch APK với Gradle
+      - name: Biên dịch ứng dụng APK
         run: |
-          gradle wrapper
-          ./gradlew assembleDebug
+          gradle assembleDebug
 
       - name: Đóng gói và lưu file APK về máy
         uses: actions/upload-artifact@v4
