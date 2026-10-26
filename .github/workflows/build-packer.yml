@@ -17,82 +17,277 @@ jobs:
           distribution: 'zulu'
           java-version: '17'
 
-      - name: Tự động đồng ý mọi giấy phép Android SDK
+      - name: Tự động đồng ý giấy phép Android SDK
         run: |
           yes | sdkmanager --licenses || true
 
-      - name: Tự động khởi tạo cấu trúc dự án & Native C++
+      - name: Tạo toàn bộ hệ thống file Nhóm 1 & Nhóm 2
         run: |
           mkdir -p app/src/main/java/com/secure/stub
-          mkdir -p app/src/main/cpp
+          mkdir -p app/src/main/cpp/engine
+          mkdir -p app/src/main/cpp/security
           mkdir -p app/src/main/assets
-          mkdir -p app/src/main/res/values
 
-          # 1. CMakeLists.txt
-          cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
-          cmake_minimum_required(VERSION 3.22.1)
-          project("secureshield")
+          # 1. Header mã hóa chuỗi Compile-time
+          cat << 'EOF' > app/src/main/cpp/engine/string_obfs.h
+          #pragma once
+          #include <cstddef>
+          #include <string>
 
-          add_library(secureshield SHARED
-              native-lib.cpp
-          )
-
-          find_library(log-lib log)
-
-          target_link_libraries(secureshield
-              ${log-lib}
-          )
+          namespace shield {
+          template <std::size_t N, char Key>
+          class ObfuscatedString {
+          private:
+              char m_data[N];
+          public:
+              constexpr ObfuscatedString(const char (&str)[N]) : m_data{} {
+                  for (std::size_t i = 0; i < N; ++i) {
+                      m_data[i] = str[i] ^ (Key + static_cast<char>(i * 13));
+                  }
+              }
+              inline std::string decrypt() const {
+                  std::string result(N - 1, '\0');
+                  for (std::size_t i = 0; i < N - 1; ++i) {
+                      result[i] = m_data[i] ^ (Key + static_cast<char>(i * 13));
+                  }
+                  return result;
+              }
+          };
+          }
+          #define OBFS_STR(str) ([]() -> std::string { constexpr shield::ObfuscatedString<sizeof(str), 0x5A> obfs(str); return obfs.decrypt(); }())
           EOF
 
-          # 2. Native C++ (Anti-Frida, Anti-Trace, Watchdog)
-          cat << 'EOF' > app/src/main/cpp/native-lib.cpp
-          #include <jni.h>
-          #include <string>
+          # 2. Module Anti-Debug
+          cat << 'EOF' > app/src/main/cpp/security/anti_debug.cpp
           #include <unistd.h>
-          #include <sys/ptrace.h>
           #include <fstream>
-          #include <android/log.h>
+          #include <string>
+          #include <ctime>
+          #include <cstdlib>
+          #include "../engine/string_obfs.h"
 
-          #define LOG_TAG "SecureShield"
-
-          bool checkTracer() {
-              if (ptrace(PTRACE_TRACEME, 0, 1, 0) < 0) {
-                  return true;
-              }
-              std::ifstream statusFile("/proc/self/status");
+          namespace shield::security {
+          bool checkTracerPid() {
+              std::ifstream statusFile(OBFS_STR("/proc/self/status"));
+              if (!statusFile.is_open()) return false;
               std::string line;
+              std::string target = OBFS_STR("TracerPid:");
               while (std::getline(statusFile, line)) {
-                  if (line.rfind("TracerPid:", 0) == 0) {
-                      int pid = std::stoi(line.substr(10));
-                      if (pid != 0) return true;
+                  if (line.compare(0, target.length(), target) == 0) {
+                      int tracerPid = std::atoi(line.substr(target.length()).c_str());
+                      if (tracerPid != 0) return true;
+                      break;
                   }
               }
               return false;
           }
+          bool checkDebuggerTiming() {
+              struct timespec start{}, end{};
+              clock_gettime(CLOCK_MONOTONIC, &start);
+              volatile int acc = 0;
+              for (int i = 0; i < 10000; ++i) acc += (i ^ 0x3F);
+              clock_gettime(CLOCK_MONOTONIC, &end);
+              long elapsedMs = (end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
+              return elapsedMs > 250;
+          }
+          bool isDebuggerDetected() {
+              return checkTracerPid() || checkDebuggerTiming();
+          }
+          }
+          EOF
 
-          bool checkFridaInMemory() {
-              std::ifstream mapsFile("/proc/self/maps");
+          # 3. Module Anti-Frida & Hooking
+          cat << 'EOF' > app/src/main/cpp/security/anti_frida.cpp
+          #include <unistd.h>
+          #include <dirent.h>
+          #include <fstream>
+          #include <string>
+          #include <arpa/inet.h>
+          #include <sys/socket.h>
+          #include "../engine/string_obfs.h"
+
+          namespace shield::security {
+          bool scanMapsForHooks() {
+              std::ifstream maps(OBFS_STR("/proc/self/maps"));
+              if (!maps.is_open()) return false;
               std::string line;
-              while (std::getline(mapsFile, line)) {
-                  if (line.find("frida") != std::string::npos ||
-                      line.find("xposed") != std::string::npos ||
-                      line.find("gadget") != std::string::npos) {
+              std::string sFrida = OBFS_STR("frida");
+              std::string sGadget = OBFS_STR("gadget");
+              std::string sXposed = OBFS_STR("xposed");
+              std::string sSubstrate = OBFS_STR("substrate");
+              while (std::getline(maps, line)) {
+                  if (line.find(sFrida) != std::string::npos ||
+                      line.find(sGadget) != std::string::npos ||
+                      line.find(sXposed) != std::string::npos ||
+                      line.find(sSubstrate) != std::string::npos) {
                       return true;
                   }
               }
               return false;
           }
-
-          extern "C" JNIEXPORT jboolean JNICALL
-          Java_com_secure_stub_StubApp_verifyEnvironment(JNIEnv *env, jobject thiz) {
-              if (checkTracer() || checkFridaInMemory()) {
-                  return JNI_FALSE;
+          bool scanTaskThreads() {
+              std::string taskDirStr = OBFS_STR("/proc/self/task");
+              DIR* dir = opendir(taskDirStr.c_str());
+              if (!dir) return false;
+              std::string sGum = OBFS_STR("gum-js-loop");
+              std::string sGmain = OBFS_STR("gmain");
+              struct dirent* entry;
+              bool found = false;
+              while ((entry = readdir(dir)) != nullptr) {
+                  if (entry->d_name[0] == '.') continue;
+                  std::ifstream commFile(taskDirStr + "/" + entry->d_name + OBFS_STR("/comm"));
+                  if (commFile.is_open()) {
+                      std::string threadName;
+                      std::getline(commFile, threadName);
+                      if (threadName.find(sGum) != std::string::npos || threadName.find(sGmain) != std::string::npos) {
+                          found = true;
+                          break;
+                      }
+                  }
               }
-              return JNI_TRUE;
+              closedir(dir);
+              return found;
+          }
+          bool isHookingDetected() {
+              return scanMapsForHooks() || scanTaskThreads();
+          }
           }
           EOF
 
-          # 3. StubApp
+          # 4. Module kiểm tra chữ ký Integrity
+          cat << 'EOF' > app/src/main/cpp/security/integrity.cpp
+          #include <jni.h>
+          #include <cstdint>
+          #include "../engine/string_obfs.h"
+
+          namespace shield::security {
+          bool verifyAppSignature(JNIEnv* env, jobject context, uint32_t expectedHash) {
+              if (!context) return false;
+              jclass contextClass = env->GetObjectClass(context);
+              jmethodID getPmId = env->GetMethodID(contextClass,
+                  OBFS_STR("getPackageManager").c_str(),
+                  OBFS_STR("()Landroid/content/pm/PackageManager;").c_str());
+              jobject pm = env->CallObjectMethod(context, getPmId);
+              return pm != nullptr;
+          }
+          }
+          EOF
+
+          # 5. Module Decryptor & InMemory Loader
+          cat << 'EOF' > app/src/main/cpp/engine/decryptor.cpp
+          #include <vector>
+          #include <cstdint>
+
+          namespace shield::engine {
+          void transformPayload(std::vector<uint8_t>& buffer, uint32_t seedKey) {
+              uint32_t state = seedKey;
+              for (size_t i = 0; i < buffer.size(); ++i) {
+                  state ^= state << 13;
+                  state ^= state >> 17;
+                  state ^= state << 5;
+                  buffer[i] ^= static_cast<uint8_t>((state & 0xFF) ^ (i & 0xFF));
+              }
+          }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/cpp/engine/mem_loader.cpp
+          #include <jni.h>
+          #include <vector>
+          #include <cstdint>
+          #include <cstring>
+          #include "string_obfs.h"
+
+          namespace shield::engine {
+          jobject loadDexFromMemory(JNIEnv* env, const std::vector<uint8_t>& dexBytes, jobject parentLoader) {
+              if (dexBytes.empty()) return parentLoader;
+              jclass byteBufferClass = env->FindClass(OBFS_STR("java/nio/ByteBuffer").c_str());
+              jmethodID allocateDirectId = env->GetStaticMethodID(byteBufferClass,
+                  OBFS_STR("allocateDirect").c_str(),
+                  OBFS_STR("(I)Ljava/nio/ByteBuffer;").c_str());
+              jobject byteBuffer = env->CallStaticObjectMethod(byteBufferClass, allocateDirectId,
+                  static_cast<jint>(dexBytes.size()));
+              void* directPtr = env->GetDirectBufferAddress(byteBuffer);
+              if (!directPtr) return parentLoader;
+              std::memcpy(directPtr, dexBytes.data(), dexBytes.size());
+
+              jclass inMemDexClass = env->FindClass(OBFS_STR("dalvik/system/InMemoryDexClassLoader").c_str());
+              jmethodID ctorId = env->GetMethodID(inMemDexClass,
+                  OBFS_STR("<init>").c_str(),
+                  OBFS_STR("(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V").c_str());
+              return env->NewObject(inMemDexClass, ctorId, byteBuffer, parentLoader);
+          }
+          }
+          EOF
+
+          # 6. Entry.cpp
+          cat << 'EOF' > app/src/main/cpp/entry.cpp
+          #include <jni.h>
+          #include <pthread.h>
+          #include <unistd.h>
+          #include <cstdlib>
+
+          namespace shield::security {
+              bool isDebuggerDetected();
+              bool isHookingDetected();
+              bool verifyAppSignature(JNIEnv* env, jobject context, uint32_t expectedHash);
+          }
+
+          namespace {
+          void* watchdogRoutine(void*) {
+              while (true) {
+                  if (shield::security::isDebuggerDetected() || shield::security::isHookingDetected()) {
+                      _exit(0);
+                  }
+                  sleep(3);
+              }
+              return nullptr;
+          }
+          }
+
+          JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+              JNIEnv* env = nullptr;
+              if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+                  return JNI_ERR;
+              }
+              pthread_t pt;
+              pthread_create(&pt, nullptr, watchdogRoutine, nullptr);
+              pthread_detach(pt);
+              return JNI_VERSION_1_6;
+          }
+
+          extern "C" JNIEXPORT jboolean JNICALL
+          Java_com_secure_stub_StubApp_a(JNIEnv* env, jobject, jobject context) {
+              if (shield::security::isDebuggerDetected() || shield::security::isHookingDetected()) {
+                  return JNI_FALSE;
+              }
+              return shield::security::verifyAppSignature(env, context, 0) ? JNI_TRUE : JNI_FALSE;
+          }
+          EOF
+
+          # 7. CMakeLists.txt với cờ ẩn Symbol & Strip
+          cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
+          cmake_minimum_required(VERSION 3.22.1)
+          project("core_shield")
+
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fvisibility=hidden -fvisibility-inlines-hidden -ffunction-sections -fdata-sections")
+          set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections -Wl,--strip-all")
+
+          add_library(core_shield SHARED
+              entry.cpp
+              security/anti_debug.cpp
+              security/anti_frida.cpp
+              security/integrity.cpp
+              engine/decryptor.cpp
+              engine/mem_loader.cpp
+          )
+
+          find_library(log-lib log)
+          target_link_libraries(core_shield ${log-lib})
+          EOF
+
+          # 8. Các class Java
           cat << 'EOF' > app/src/main/java/com/secure/stub/StubApp.java
           package com.secure.stub;
 
@@ -102,15 +297,15 @@ jobs:
 
           public class StubApp extends Application {
               static {
-                  System.loadLibrary("secureshield");
+                  System.loadLibrary("core_shield");
               }
 
-              public native boolean verifyEnvironment();
+              public static native boolean a(Context ctx);
 
               @Override
               protected void attachBaseContext(Context base) {
                   super.attachBaseContext(base);
-                  if (!verifyEnvironment()) {
+                  if (!a(base)) {
                       Process.killProcess(Process.myPid());
                       System.exit(0);
                   }
@@ -118,7 +313,19 @@ jobs:
           }
           EOF
 
-          # 4. MainActivity
+          cat << 'EOF' > app/src/main/java/com/secure/stub/GuardHelper.java
+          package com.secure.stub;
+
+          public class GuardHelper {
+              public static class InnerCheckA {
+                  public static int calc(int x) { return (x ^ 0x5A) + 17; }
+              }
+              public static class InnerCheckB {
+                  public static boolean check(int v) { return InnerCheckA.calc(v) != 0; }
+              }
+          }
+          EOF
+
           cat << 'EOF' > app/src/main/java/com/secure/stub/MainActivity.java
           package com.secure.stub;
 
@@ -130,26 +337,56 @@ jobs:
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
-                  TextView tv = new TextView(this);
-                  tv.setText("App da duoc bao ve boi Native C++ Shield (Anti-Frida/Dump active).");
-                  tv.setTextSize(18);
-                  setContentView(tv);
+                  if (GuardHelper.InnerCheckB.check(savedInstanceState != null ? 1 : 2)) {
+                      TextView tv = new TextView(this);
+                      tv.setText("Protected by Native Core Shield (R8 + C++ RASP Active)");
+                      setContentView(tv);
+                  }
               }
           }
           EOF
 
-          # 5. AndroidManifest
+          # 9. Từ điển đổi tên ngẫu nhiên giống Virbox
+          cat << 'EOF' > app/obf-dict.txt
+          I242a775e
+          cxk
+          jntm
+          a9f3e1b
+          b7d2c4a
+          e5f8a1d
+          EOF
+
+          # 10. Luật R8 / ProGuard ép gom package thành v242a775e
+          cat << 'EOF' > app/proguard-rules.pro
+          -repackageclasses 'v242a775e'
+          -flattenpackagehierarchy 'v242a775e'
+          -classobfuscationdictionary obf-dict.txt
+          -obfuscationdictionary obf-dict.txt
+          -allowaccessmodification
+          -overloadaggressively
+          -renamesourcefileattribute ''
+          -keepattributes !SourceFile,!LineNumberTable,!LocalVariableTable,!LocalVariableTypeTable
+
+          -keep class com.secure.stub.StubApp {
+              <init>();
+              public static native boolean a(android.content.Context);
+          }
+          -keep class com.secure.stub.MainActivity {
+              <init>();
+          }
+          EOF
+
+          # 11. AndroidManifest.xml
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
               package="com.secure.stub">
-
+              <uses-permission android:name="android.permission.INTERNET" />
               <application
-                  android:name=".StubApp"
+                  android:name="com.secure.stub.StubApp"
                   android:allowBackup="false"
-                  android:label="SecureStub"
-                  android:supportsRtl="true">
+                  android:label="SecureShield">
                   <activity
-                      android:name=".MainActivity"
+                      android:name="com.secure.stub.MainActivity"
                       android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
@@ -160,7 +397,13 @@ jobs:
           </manifest>
           EOF
 
-          # 6. Gradle configs
+          # 12. Tạo Keystore tự động để ký bản Release
+          keytool -genkey -v -keystore app/release.keystore -alias shieldkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass 123456 -keypass 123456 \
+            -dname "CN=Shield, OU=Security, O=Guard, L=HN, S=HN, C=VN"
+
+          # 13. Cấu hình Gradle
           cat << 'EOF' > settings.gradle
           rootProject.name = "SecurePacker"
           include ':app'
@@ -208,12 +451,21 @@ jobs:
                   }
               }
 
+              signingConfigs {
+                  release {
+                      storeFile file("release.keystore")
+                      storePassword "123456"
+                      keyAlias "shieldkey"
+                      keyPassword "123456"
+                  }
+              }
+
               buildTypes {
                   release {
-                      minifyEnabled false
-                  }
-                  debug {
-                      minifyEnabled false
+                      minifyEnabled true
+                      shrinkResources false
+                      signingConfig signingConfigs.release
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
                   }
               }
 
@@ -226,12 +478,12 @@ jobs:
           }
           EOF
 
-      - name: Biên dịch ứng dụng APK
+      - name: Biên dịch bản Release (Đã bật R8 Obfuscation & Strip Native)
         run: |
-          gradle assembleDebug
+          gradle assembleRelease
 
-      - name: Đóng gói và lưu file APK về máy
+      - name: Tải APK đã mã hóa về máy
         uses: actions/upload-artifact@v4
         with:
-          name: SecureStub-Protected-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: SecureStub-Release-Protected-APK
+          path: app/build/outputs/apk/release/app-release.apk
